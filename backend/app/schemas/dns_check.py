@@ -10,5 +10,8 @@ class DNSCheckOut(BaseModel):
     latency_ms: Optional[int]
     checked_at: datetime
 
+    previous_value: Optional[str] = None
+    changed: bool = False
+
     class Config:
         from_attributes = True
