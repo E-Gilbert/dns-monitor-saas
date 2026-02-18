@@ -17,3 +17,7 @@ def health():
     return {"status": "ok"}
 
 app.include_router(domains_router)
+
+@app.get("/")
+def root():
+    return {"message": "DNS Monitor SaaS API. Visit /docs"}
