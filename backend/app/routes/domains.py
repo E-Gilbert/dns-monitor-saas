@@ -7,6 +7,7 @@ from app.models.dns_check import DNSCheck
 from app.schemas.domain import DomainCreate, DomainOut
 from app.schemas.dns_check import DNSCheckOut
 from app.dns_client import resolve_a
+from services.ai_insights import generate_dns_insight
 
 router = APIRouter(prefix="/domains", tags=["Domains"])
 
@@ -66,10 +67,33 @@ def run_check(domain_id: int, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(check)
 
-    # (+) Attach computed fields to the returned object (not stored in DB)
-    check.previous_value = previous_value
-    check.changed = changed
-    return check
+    # AI logic trigger:
+    # When the DNS value changes, we generate a short "DNS Insight" that helps
+    # interpret the impact. This is simulated LLM logic with a safe fallback.
+    change = None
+    insight = None
+    if changed:
+        change = f"{previous_value} -> {ip}"
+        try:
+            insight = generate_dns_insight(check.record_type, previous_value, ip)
+        except Exception:
+            # generate_dns_insight() should never raise, but we keep this as a final safety net.
+            insight = None
+
+    # Return a response model instead of mutating SQLAlchemy relationship fields.
+    return DNSCheckOut(
+        id=check.id,
+        domain_id=check.domain_id,
+        record_type=check.record_type,
+        resolved_value=check.resolved_value,
+        latency_ms=check.latency_ms,
+        checked_at=check.checked_at,
+        domain=domain.name,
+        change=change,
+        insight=insight,
+        previous_value=previous_value,
+        changed=changed,
+    )
 
 
 @router.get("/{domain_id}/history", response_model=list[DNSCheckOut])
@@ -78,9 +102,65 @@ def get_history(domain_id: int, db: Session = Depends(get_db)):
     if not domain:
         raise HTTPException(status_code=404, detail="Domain not found")
 
-    return (
+    # Compute change + AI insight on the fly.
+    # (We do not persist insight to keep this minimal; it can be regenerated safely.)
+    checks = (
         db.query(DNSCheck)
         .filter(DNSCheck.domain_id == domain_id)
-        .order_by(DNSCheck.checked_at.desc())
+        .order_by(DNSCheck.checked_at.asc())
         .all()
     )
+
+    # Safe fallback: return empty list when no history exists.
+    if not checks:
+        return []
+
+    previous_value = None
+    response_items = []
+    for check in checks:
+        # Keep these computed fields consistent with run_check().
+        changed = (
+            previous_value is not None
+            and check.resolved_value is not None
+            and check.resolved_value != previous_value
+        )
+
+        change = None
+        insight = None
+        if changed:
+            change = f"{previous_value} -> {check.resolved_value}"
+            try:
+                # AI logic trigger: only when DNS value changes.
+                insight = generate_dns_insight(
+                    check.record_type,
+                    previous_value,
+                    check.resolved_value,
+                )
+            except Exception:
+                insight = None
+
+        response_items.append(
+            DNSCheckOut(
+                id=check.id,
+                domain_id=check.domain_id,
+                record_type=check.record_type,
+                resolved_value=check.resolved_value,
+                latency_ms=check.latency_ms,
+                checked_at=check.checked_at,
+                domain=domain.name,
+                change=change,
+                insight=insight,
+                previous_value=previous_value,
+                changed=changed,
+            )
+        )
+
+        previous_value = check.resolved_value
+
+    # Safe fallback for "no DNS changes" cases: return [].
+    changed_items = [item for item in response_items if item.changed]
+    if not changed_items:
+        return []
+
+    # Return newest changed events first for the UI.
+    return list(reversed(changed_items))
